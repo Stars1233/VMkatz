@@ -1,8 +1,13 @@
 use crate::error::{GovmemError, Result};
-use crate::memory::PhysicalMemory;
-use crate::paging::translate::PageTableWalker;
+use crate::memory::{PhysicalMemory, VirtualMemory};
+use crate::paging::translate::{PageTableWalker, ProcessMemory};
 use crate::windows::eprocess::EprocessReader;
 use crate::windows::offsets::EprocessOffsets;
+
+/// PEB + 0x20 = ProcessParameters (RTL_USER_PROCESS_PARAMETERS*)
+const PEB_PROCESS_PARAMETERS: u64 = 0x20;
+/// RTL_USER_PROCESS_PARAMETERS + 0x60 = ImagePathName (UNICODE_STRING)
+const PROCESS_PARAMS_IMAGE_PATH: u64 = 0x60;
 
 /// A discovered Windows process.
 #[derive(Debug)]
@@ -179,12 +184,19 @@ pub fn enumerate_processes(
 
         // Skip PID 0 (System Idle Process) - has no valid DTB, PEB, or name
         if pid != 0 {
-            let name = reader
+            let short_name = reader
                 .read_image_name(phys, eprocess_phys)
                 .unwrap_or_else(|_| "<unknown>".to_string());
 
             let dtb = reader.read_dtb(phys, eprocess_phys).unwrap_or(0);
             let peb = reader.read_peb(phys, eprocess_phys).unwrap_or(0);
+
+            // Try full name from PEB if available (fixes 15-char truncation)
+            let name = if peb != 0 && dtb != 0 {
+                read_full_image_name(phys, dtb, peb).unwrap_or(short_name)
+            } else {
+                short_name
+            };
 
             processes.push(Process {
                 pid,
@@ -199,4 +211,37 @@ pub fn enumerate_processes(
     }
 
     Ok(processes)
+}
+
+/// Read the full image name from PEB → ProcessParameters → ImagePathName.
+/// Returns just the filename (e.g. "fontdrvhost.exe") from the full NT path.
+/// Uses the process's own DTB for virtual address translation.
+fn read_full_image_name(phys: &impl PhysicalMemory, dtb: u64, peb: u64) -> Option<String> {
+    let vmem = ProcessMemory::new(phys, dtb);
+
+    // PEB + 0x20 → ProcessParameters pointer
+    let params_ptr = vmem.read_virt_u64(peb + PEB_PROCESS_PARAMETERS).ok()?;
+    if params_ptr == 0 || params_ptr < 0x10000 {
+        return None;
+    }
+
+    // ProcessParameters + 0x60 → ImagePathName (UNICODE_STRING)
+    let full_path = vmem
+        .read_win_unicode_string(params_ptr + PROCESS_PARAMS_IMAGE_PATH)
+        .ok()?;
+    if full_path.is_empty() {
+        return None;
+    }
+
+    // Extract just the filename from the path (handles both \ and / separators)
+    let name = full_path
+        .rsplit(|c| c == '\\' || c == '/')
+        .next()
+        .unwrap_or(&full_path);
+
+    if name.is_empty() {
+        return None;
+    }
+
+    Some(name.to_string())
 }
