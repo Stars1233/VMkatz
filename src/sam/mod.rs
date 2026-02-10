@@ -2,6 +2,7 @@ pub mod hive;
 pub mod bootkey;
 pub mod hashes;
 pub mod lsa;
+mod ntfs_fallback;
 
 use std::collections::HashMap;
 use std::io::{Read, Seek};
@@ -285,31 +286,50 @@ fn read_hive_files<R: Read + Seek>(
     // Wrap reader with partition offset
     let mut part_reader = PartitionReader::new(reader, partition_offset);
 
-    let ntfs = ntfs::Ntfs::new(&mut part_reader).map_err(|e| {
-        crate::error::GovmemError::DecryptionError(format!("NTFS parse error: {}", e))
-    })?;
+    let ntfs = match ntfs::Ntfs::new(&mut part_reader) {
+        Ok(n) => n,
+        Err(e) => {
+            log::info!("NTFS parse error: {}, trying MFTMirr fallback", e);
+            return ntfs_fallback::try_mftmirr_fallback(
+                part_reader.inner_mut(),
+                partition_offset,
+            );
+        }
+    };
 
-    let root = ntfs.root_directory(&mut part_reader).map_err(|e| {
-        crate::error::GovmemError::DecryptionError(format!("NTFS root dir error: {}", e))
-    })?;
+    match ntfs.root_directory(&mut part_reader) {
+        Ok(root) => {
+            // Navigate: Windows/System32/config/
+            let windows = find_entry(&ntfs, &root, &mut part_reader, "Windows")?;
+            let system32 = find_entry(&ntfs, &windows, &mut part_reader, "System32")?;
+            let config = find_entry(&ntfs, &system32, &mut part_reader, "config")?;
 
-    // Navigate: Windows/System32/config/
-    let windows = find_entry(&ntfs, &root, &mut part_reader, "Windows")?;
-    let system32 = find_entry(&ntfs, &windows, &mut part_reader, "System32")?;
-    let config = find_entry(&ntfs, &system32, &mut part_reader, "config")?;
+            let sam_file = find_entry(&ntfs, &config, &mut part_reader, "SAM")?;
+            let system_file = find_entry(&ntfs, &config, &mut part_reader, "SYSTEM")?;
 
-    let sam_file = find_entry(&ntfs, &config, &mut part_reader, "SAM")?;
-    let system_file = find_entry(&ntfs, &config, &mut part_reader, "SYSTEM")?;
+            let sam_data = read_file_data(&sam_file, &mut part_reader)?;
+            let system_data = read_file_data(&system_file, &mut part_reader)?;
 
-    let sam_data = read_file_data(&sam_file, &mut part_reader)?;
-    let system_data = read_file_data(&system_file, &mut part_reader)?;
+            // SECURITY hive is optional - not all disk images may have it accessible
+            let security_data = find_entry(&ntfs, &config, &mut part_reader, "SECURITY")
+                .ok()
+                .and_then(|f| read_file_data(&f, &mut part_reader).ok());
 
-    // SECURITY hive is optional - not all disk images may have it accessible
-    let security_data = find_entry(&ntfs, &config, &mut part_reader, "SECURITY")
-        .ok()
-        .and_then(|f| read_file_data(&f, &mut part_reader).ok());
-
-    Ok((sam_data, system_data, security_data))
+            Ok((sam_data, system_data, security_data))
+        }
+        Err(e) => {
+            log::info!(
+                "NTFS root dir error: {}, trying MFTMirr fallback",
+                e,
+            );
+            // Drop ntfs/part_reader borrows, then use MFTMirr fallback
+            drop(ntfs);
+            ntfs_fallback::try_mftmirr_fallback(
+                part_reader.inner_mut(),
+                partition_offset,
+            )
+        }
+    }
 }
 
 /// Find a directory entry by name (case-insensitive).
@@ -391,6 +411,11 @@ pub(crate) struct PartitionReader<'a, R: Read + Seek> {
 impl<'a, R: Read + Seek> PartitionReader<'a, R> {
     pub(crate) fn new(inner: &'a mut R, offset: u64) -> Self {
         Self { inner, offset }
+    }
+
+    /// Access the underlying reader (for fallback paths that manage offsets themselves).
+    fn inner_mut(&mut self) -> &mut R {
+        self.inner
     }
 }
 
