@@ -127,7 +127,7 @@ fn main() -> anyhow::Result<()> {
             }
         });
         let disk_ref = disk_path_str.as_ref().map(|d| Path::new(d.as_str()));
-        return run_lsass(input_path, &args, pagefile_reader.as_ref(), disk_ref);
+        run_lsass(input_path, &args, pagefile_reader.as_ref(), disk_ref)
     }
     #[cfg(not(feature = "sam"))]
     run_lsass(input_path, &args, Default::default(), Default::default())

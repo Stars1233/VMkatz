@@ -249,7 +249,7 @@ fn read_full_image_name(phys: &impl PhysicalMemory, dtb: u64, peb: u64) -> Optio
 
     // Extract just the filename from the path (handles both \ and / separators)
     let name = full_path
-        .rsplit(|c| c == '\\' || c == '/')
+        .rsplit(['\\', '/'])
         .next()
         .unwrap_or(&full_path);
 

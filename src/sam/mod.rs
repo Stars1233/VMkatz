@@ -640,7 +640,7 @@ fn scan_for_hbin_roots<R: Read + Seek>(reader: &mut R) -> Result<HiveFiles> {
                     u32::from_le_bytes(chunk[pos + 8..pos + 12].try_into().unwrap());
 
                 // Only interested in first hbin of a hive (offset_in_hive == 0)
-                if hbin_hive_off == 0 && hbin_size >= 0x1000 && hbin_size <= 0x100000 {
+                if hbin_hive_off == 0 && (0x1000..=0x100000).contains(&hbin_size) {
                     let disk_offset = offset + pos as u64;
                     if let Some((name, data)) = try_read_hbin_hive(reader, disk_offset) {
                         log::info!(
@@ -783,7 +783,7 @@ fn try_read_hbin_hive<R: Read + Seek>(
             u32::from_le_bytes(hbin_buf[4..8].try_into().unwrap()) as usize;
         let block_size =
             u32::from_le_bytes(hbin_buf[8..12].try_into().unwrap()) as usize;
-        if block_size < 0x1000 || block_size > 0x100000 {
+        if !(0x1000..=0x100000).contains(&block_size) {
             break;
         }
         // Validate offset_in_hive matches accumulated data
@@ -993,8 +993,9 @@ fn scan_vmdk_grains_for_hives(
         }
     }
 
-    if sam_data.is_some() && system_data.is_some() {
-        return Ok((sam_data.unwrap(), system_data.unwrap(), security_data));
+    match (sam_data, system_data) {
+        (Some(sam), Some(system)) => return Ok((sam, system, security_data)),
+        (s, sys) => { sam_data = s; system_data = sys; }
     }
 
     // 2b: Try hbin root candidates — read contiguous hbin blocks
@@ -1027,7 +1028,7 @@ fn scan_vmdk_grains_for_hives(
                 u32::from_le_bytes(hbin_buf[4..8].try_into().unwrap()) as usize;
             let block_size =
                 u32::from_le_bytes(hbin_buf[8..12].try_into().unwrap()) as usize;
-            if block_size < 0x1000 || block_size > 0x100000 {
+            if !(0x1000..=0x100000).contains(&block_size) {
                 break;
             }
             if hbin_hive_off != hbin_data.len() {
@@ -1058,8 +1059,9 @@ fn scan_vmdk_grains_for_hives(
         }
     }
 
-    if sam_data.is_some() && system_data.is_some() {
-        return Ok((sam_data.unwrap(), system_data.unwrap(), security_data));
+    match (sam_data, system_data) {
+        (Some(sam), Some(system)) => return Ok((sam, system, security_data)),
+        (s, sys) => { sam_data = s; system_data = sys; }
     }
 
     // Phase 2c: Fragmented hive assembly
@@ -1160,7 +1162,7 @@ fn scan_vmdk_grains_for_hives(
         }
         if !has_system {
             if !has_sam {
-                detail.push_str(",");
+                detail.push(',');
             }
             detail.push_str(" SYSTEM not found");
         }
@@ -1288,13 +1290,7 @@ fn assemble_with_backtracking(
             continue;
         }
         let mut sorted = cands.clone();
-        sorted.sort_by_key(|&(virt, _)| {
-            if virt >= root_virt {
-                virt - root_virt
-            } else {
-                root_virt - virt
-            }
-        });
+        sorted.sort_by_key(|&(virt, _)| virt.abs_diff(root_virt));
         // Limit to closest candidates to keep search manageable
         sorted.truncate(10);
         sorted_by_offset.insert(off, sorted);
@@ -1362,8 +1358,7 @@ fn assemble_with_backtracking(
         };
 
         // Try candidates starting from index 0 (proximity-sorted, closest first)
-        for ci in 0..candidates.len() {
-            let (virt_off, blk_size) = candidates[ci];
+        for (ci, &(virt_off, blk_size)) in candidates.iter().enumerate() {
             if let Some(block) = read_hbin_at(vmdk, virt_off, blk_size, current_offset) {
                 choices.push((current_offset, ci, block));
                 current_offset += blk_size;
@@ -1442,8 +1437,7 @@ fn do_backtrack(
 ) -> bool {
     while let Some((off, ci, _)) = choices.pop() {
         if let Some(candidates) = sorted_by_offset.get(&off) {
-            for next_ci in (ci + 1)..candidates.len() {
-                let (virt_off, blk_size) = candidates[next_ci];
+            for (next_ci, &(virt_off, blk_size)) in candidates.iter().enumerate().skip(ci + 1) {
                 if let Some(block) = read_hbin_at(vmdk, virt_off, blk_size, off) {
                     choices.push((off, next_ci, block));
                     *current_offset = off + blk_size;
