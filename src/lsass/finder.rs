@@ -375,21 +375,43 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
         }
     }
 
-    // Merge MSV credentials with unknown LUID (0) into matching credentials by username+domain
+    // Merge MSV credentials with unknown LUID (0) into matching credentials by username+domain.
+    // When the credential blob has an empty domain (common for local logons), match by username only.
+    // Prefer Interactive (logon_type=2) sessions over other types.
     if let Some(orphan) = all_creds.remove(&0) {
         if let Some(msv_cred) = orphan.msv {
-            let key = (msv_cred.username.to_lowercase(), msv_cred.domain.to_lowercase());
+            let cred_user = msv_cred.username.to_lowercase();
+            let cred_domain = msv_cred.domain.to_lowercase();
             let mut merged = false;
-            for cred in all_creds.values_mut() {
-                let cred_key = (cred.username.to_lowercase(), cred.domain.to_lowercase());
-                if cred_key == key {
+            // Find best matching session: prefer Interactive (logon_type=2)
+            let mut best_luid: Option<u64> = None;
+            let mut best_logon_type: u32 = 0;
+            for cred in all_creds.values() {
+                let sess_user = cred.username.to_lowercase();
+                let sess_domain = cred.domain.to_lowercase();
+                let matches = if cred_domain.is_empty() {
+                    sess_user == cred_user
+                } else {
+                    sess_user == cred_user && sess_domain == cred_domain
+                };
+                if matches {
+                    // Prefer Interactive (2), then any non-zero logon type, then any
+                    let priority = if cred.logon_type == 2 { 3 } else if cred.logon_type != 0 { 2 } else { 1 };
+                    let best_priority = if best_logon_type == 2 { 3 } else if best_logon_type != 0 { 2 } else { 1 };
+                    if best_luid.is_none() || priority > best_priority {
+                        best_luid = Some(cred.luid);
+                        best_logon_type = cred.logon_type;
+                    }
+                }
+            }
+            if let Some(target_luid) = best_luid {
+                if let Some(cred) = all_creds.get_mut(&target_luid) {
                     cred.msv = Some(msv_cred.clone());
                     merged = true;
                     log::debug!(
                         "Merged MSV credential into LUID 0x{:x} (user='{}' domain='{}')",
                         cred.luid, cred.username, cred.domain
                     );
-                    break;
                 }
             }
             if !merged {
