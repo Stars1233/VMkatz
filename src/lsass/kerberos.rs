@@ -108,25 +108,42 @@ pub fn extract_kerberos_credentials(
         let luid = vmem.read_virt_u64(entry + offsets.luid).unwrap_or(0);
         let cred_ptr = vmem.read_virt_u64(entry + offsets.credentials_ptr).unwrap_or(0);
 
-        if cred_ptr != 0 && luid != 0 {
-            let username = vmem.read_win_unicode_string(cred_ptr).unwrap_or_default();
-            let domain = vmem.read_win_unicode_string(cred_ptr + 0x10).unwrap_or_default();
-
-            if !username.is_empty() {
-                let password = extract_kerb_password(vmem, cred_ptr, offsets.cred_password, keys).unwrap_or_default();
-                if !password.is_empty() {
-                    log::info!("Kerberos: LUID=0x{:x} user={} domain={}", luid, username, domain);
-                    results.push((
-                        luid,
-                        KerberosCredential {
-                            username: username.clone(),
-                            domain: domain.clone(),
-                            password,
-                        },
-                    ));
-                }
-            }
+        if cred_ptr == 0 || luid == 0 {
+            log::debug!(
+                "Kerberos AVL node 0x{:x}: luid=0x{:x} cred_ptr=0x{:x} (skipped)",
+                node_ptr, luid, cred_ptr
+            );
+            continue;
         }
+
+        let username = vmem.read_win_unicode_string(cred_ptr).unwrap_or_default();
+        let domain = vmem.read_win_unicode_string(cred_ptr + 0x10).unwrap_or_default();
+
+        if username.is_empty() {
+            log::debug!(
+                "Kerberos AVL node 0x{:x}: luid=0x{:x} cred_ptr=0x{:x} empty username (paged?)",
+                node_ptr, luid, cred_ptr
+            );
+            continue;
+        }
+
+        let password = extract_kerb_password(vmem, cred_ptr, offsets.cred_password, keys)
+            .unwrap_or_default();
+
+        log::info!(
+            "Kerberos: LUID=0x{:x} user={} domain={} password_len={}",
+            luid, username, domain, password.len()
+        );
+
+        // Include credentials even without a password (username+domain is valuable)
+        results.push((
+            luid,
+            KerberosCredential {
+                username: username.clone(),
+                domain: domain.clone(),
+                password,
+            },
+        ));
     }
 
     Ok(results)
