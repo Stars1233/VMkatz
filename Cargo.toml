@@ -10,6 +10,7 @@ vbox = []
 qemu = ["dep:memmap2"]
 hyperv = ["dep:memmap2"]
 sam = ["dep:ntfs", "dep:md-5", "dep:sha2"]
+"ntds.dit" = ["sam"]
 
 [dependencies]
 memmap2 = { version = "0.9", optional = true }

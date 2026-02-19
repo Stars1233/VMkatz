@@ -1,8 +1,9 @@
-pub mod hive;
 pub mod bootkey;
 pub mod cache;
 pub mod hashes;
+pub mod hive;
 pub mod lsa;
+pub mod ntds;
 mod ntfs_fallback;
 
 use std::collections::HashMap;
@@ -15,6 +16,14 @@ use crate::error::Result;
 
 /// SAM + SYSTEM + optional SECURITY hive file data.
 type HiveFiles = (Vec<u8>, Vec<u8>, Option<Vec<u8>>);
+
+/// NTDS + SYSTEM files extracted from a disk image.
+#[derive(Debug)]
+pub struct NtdsArtifacts {
+    pub ntds_data: Vec<u8>,
+    pub system_data: Vec<u8>,
+    pub partition_offset: u64,
+}
 
 /// A SAM user entry with RID, username, and NT/LM hashes.
 #[derive(Debug)]
@@ -38,6 +47,14 @@ pub struct DiskSecrets {
 pub fn extract_sam_hashes(path: &Path) -> Result<Vec<SamEntry>> {
     let secrets = extract_disk_secrets(path)?;
     Ok(secrets.sam_entries)
+}
+
+/// Extract NTDS artifacts (NTDS.dit + SYSTEM hive) from a disk image.
+///
+/// This is the input set required by offline AD secrets extraction workflows.
+pub fn extract_ntds_artifacts(path: &Path) -> Result<NtdsArtifacts> {
+    let mut disk = crate::disk::open_disk(path)?;
+    extract_ntds_artifacts_from_reader(&mut disk)
 }
 
 /// Extract both SAM hashes and LSA secrets from a disk image.
@@ -122,6 +139,34 @@ fn extract_secrets_from_reader<R: Read + Seek>(reader: &mut R) -> Result<DiskSec
             Err(e)
         }
     }
+}
+
+/// Extract NTDS artifacts from any Read+Seek source.
+fn extract_ntds_artifacts_from_reader<R: Read + Seek>(reader: &mut R) -> Result<NtdsArtifacts> {
+    let partitions = find_ntfs_partitions(reader).unwrap_or_default();
+
+    for &partition_offset in &partitions {
+        log::info!(
+            "Trying NTDS extraction on NTFS partition at offset 0x{:x}",
+            partition_offset
+        );
+        match read_ntds_artifacts(reader, partition_offset) {
+            Ok((ntds_data, system_data)) => {
+                return Ok(NtdsArtifacts {
+                    ntds_data,
+                    system_data,
+                    partition_offset,
+                });
+            }
+            Err(e) => {
+                log::info!("Partition at 0x{:x}: {}", partition_offset, e);
+            }
+        }
+    }
+
+    Err(crate::error::GovmemError::DecryptionError(
+        "NTDS.dit not found on readable NTFS partitions".to_string(),
+    ))
 }
 
 /// Process extracted hive data into DiskSecrets.
@@ -264,7 +309,9 @@ pub(crate) fn find_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec
 
         log::debug!(
             "MBR Partition {}: type=0x{:02x}, LBA_start={}",
-            i, part_type, lba_start
+            i,
+            part_type,
+            lba_start
         );
 
         // NTFS partition type is 0x07
@@ -304,14 +351,16 @@ fn find_gpt_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
 
     log::debug!(
         "GPT: entry_lba={}, num_entries={}, entry_size={}",
-        entry_lba, num_entries, entry_size
+        entry_lba,
+        num_entries,
+        entry_size
     );
 
     // "Microsoft Basic Data" GUID: EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
     // Mixed-endian byte representation
     const BASIC_DATA_GUID: [u8; 16] = [
-        0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44,
-        0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7,
+        0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99,
+        0xC7,
     ];
 
     let mut partitions = Vec::new();
@@ -348,10 +397,7 @@ fn find_gpt_ntfs_partitions<R: Read + Seek>(reader: &mut R) -> Result<Vec<u64>> 
 }
 
 /// Read SAM, SYSTEM, and (optionally) SECURITY hive files from NTFS filesystem.
-fn read_hive_files<R: Read + Seek>(
-    reader: &mut R,
-    partition_offset: u64,
-) -> Result<HiveFiles> {
+fn read_hive_files<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> Result<HiveFiles> {
     // Wrap reader with partition offset
     let mut part_reader = PartitionReader::new(reader, partition_offset);
 
@@ -359,10 +405,7 @@ fn read_hive_files<R: Read + Seek>(
         Ok(n) => n,
         Err(e) => {
             log::info!("NTFS parse error: {}, trying MFTMirr fallback", e);
-            return ntfs_fallback::try_mftmirr_fallback(
-                part_reader.inner_mut(),
-                partition_offset,
-            );
+            return ntfs_fallback::try_mftmirr_fallback(part_reader.inner_mut(), partition_offset);
         }
     };
 
@@ -387,18 +430,41 @@ fn read_hive_files<R: Read + Seek>(
             Ok((sam_data, system_data, security_data))
         }
         Err(e) => {
-            log::info!(
-                "NTFS root dir error: {}, trying MFTMirr fallback",
-                e,
-            );
+            log::info!("NTFS root dir error: {}, trying MFTMirr fallback", e,);
             // Drop ntfs/part_reader borrows, then use MFTMirr fallback
             drop(ntfs);
-            ntfs_fallback::try_mftmirr_fallback(
-                part_reader.inner_mut(),
-                partition_offset,
-            )
+            ntfs_fallback::try_mftmirr_fallback(part_reader.inner_mut(), partition_offset)
         }
     }
+}
+
+/// Read NTDS.dit + SYSTEM hive from NTFS filesystem.
+fn read_ntds_artifacts<R: Read + Seek>(
+    reader: &mut R,
+    partition_offset: u64,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut part_reader = PartitionReader::new(reader, partition_offset);
+
+    let ntfs = ntfs::Ntfs::new(&mut part_reader).map_err(|e| {
+        crate::error::GovmemError::DecryptionError(format!("NTFS parse error: {}", e))
+    })?;
+
+    let root = ntfs.root_directory(&mut part_reader).map_err(|e| {
+        crate::error::GovmemError::DecryptionError(format!("NTFS root dir error: {}", e))
+    })?;
+
+    let windows = find_entry(&ntfs, &root, &mut part_reader, "Windows")?;
+
+    let ntds_dir = find_entry(&ntfs, &windows, &mut part_reader, "NTDS")?;
+    let ntds_file = find_entry(&ntfs, &ntds_dir, &mut part_reader, "ntds.dit")?;
+    let ntds_data = read_file_data(&ntds_file, &mut part_reader)?;
+
+    let system32 = find_entry(&ntfs, &windows, &mut part_reader, "System32")?;
+    let config = find_entry(&ntfs, &system32, &mut part_reader, "config")?;
+    let system_file = find_entry(&ntfs, &config, &mut part_reader, "SYSTEM")?;
+    let system_data = read_file_data(&system_file, &mut part_reader)?;
+
+    Ok((ntds_data, system_data))
 }
 
 /// Find a directory entry by name (case-insensitive).
@@ -454,9 +520,7 @@ pub(crate) fn read_file_data<R: Read + Seek>(
         .ok_or_else(|| {
             crate::error::GovmemError::DecryptionError("No $DATA attribute".to_string())
         })?
-        .map_err(|e| {
-            crate::error::GovmemError::DecryptionError(format!("$DATA error: {}", e))
-        })?;
+        .map_err(|e| crate::error::GovmemError::DecryptionError(format!("$DATA error: {}", e)))?;
     let data_attr = data_item.to_attribute().map_err(|e| {
         crate::error::GovmemError::DecryptionError(format!("to_attribute error: {}", e))
     })?;
@@ -498,7 +562,9 @@ impl<R: Read + Seek> Seek for PartitionReader<'_, R> {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         match pos {
             std::io::SeekFrom::Start(offset) => {
-                let actual = self.inner.seek(std::io::SeekFrom::Start(self.offset + offset))?;
+                let actual = self
+                    .inner
+                    .seek(std::io::SeekFrom::Start(self.offset + offset))?;
                 Ok(actual - self.offset)
             }
             std::io::SeekFrom::Current(delta) => {
@@ -580,11 +646,7 @@ fn scan_for_hives<R: Read + Seek>(reader: &mut R) -> Result<HiveFiles> {
                     if sam_data.is_some() && system_data.is_some() {
                         log::info!("Found all required hives ({} total regf)", found_count);
                         #[allow(clippy::unnecessary_unwrap)]
-                        return Ok((
-                            sam_data.unwrap(),
-                            system_data.unwrap(),
-                            security_data,
-                        ));
+                        return Ok((sam_data.unwrap(), system_data.unwrap(), security_data));
                     }
                 }
                 // Restore read position for continued scanning
@@ -631,11 +693,7 @@ fn try_read_hive<R: Read + Seek>(reader: &mut R, offset: u64) -> Option<(String,
     // hive_bins_data_size at offset 0x28
     let bins_size = u32::from_le_bytes(header[0x28..0x2C].try_into().unwrap()) as u64;
     if bins_size == 0 || bins_size > MAX_HIVE_SIZE {
-        log::debug!(
-            "regf at 0x{:x}: bins_size={} (skipped)",
-            offset,
-            bins_size
-        );
+        log::debug!("regf at 0x{:x}: bins_size={} (skipped)", offset, bins_size);
         return None;
     }
 
@@ -728,10 +786,8 @@ fn scan_for_hbin_roots<R: Read + Seek>(reader: &mut R) -> Result<HiveFiles> {
         while pos + 0x60 <= n {
             if &chunk[pos..pos + 4] == b"hbin" {
                 // hbin header: "hbin"(4) + offset_in_hive(4) + size(4) + ...
-                let hbin_hive_off =
-                    u32::from_le_bytes(chunk[pos + 4..pos + 8].try_into().unwrap());
-                let hbin_size =
-                    u32::from_le_bytes(chunk[pos + 8..pos + 12].try_into().unwrap());
+                let hbin_hive_off = u32::from_le_bytes(chunk[pos + 4..pos + 8].try_into().unwrap());
+                let hbin_size = u32::from_le_bytes(chunk[pos + 8..pos + 12].try_into().unwrap());
 
                 // Only interested in first hbin of a hive (offset_in_hive == 0)
                 if hbin_hive_off == 0 && (0x1000..=0x100000).contains(&hbin_size) {
@@ -753,11 +809,7 @@ fn scan_for_hbin_roots<R: Read + Seek>(reader: &mut R) -> Result<HiveFiles> {
                         if sam_data.is_some() && system_data.is_some() {
                             log::info!("Found all required hives via hbin scan");
                             #[allow(clippy::unnecessary_unwrap)]
-                            return Ok((
-                                sam_data.unwrap(),
-                                system_data.unwrap(),
-                                security_data,
-                            ));
+                            return Ok((sam_data.unwrap(), system_data.unwrap(), security_data));
                         }
                     }
                     reader.seek(SeekFrom::Start(offset + n as u64))?;
@@ -774,10 +826,7 @@ fn scan_for_hbin_roots<R: Read + Seek>(reader: &mut R) -> Result<HiveFiles> {
     if let (Some(sam), Some(system)) = (sam_data, system_data) {
         Ok((sam, system, security_data))
     } else {
-        let mut detail = format!(
-            "hbin scan found {} candidate(s) but missing",
-            found_count
-        );
+        let mut detail = format!("hbin scan found {} candidate(s) but missing", found_count);
         if !has_sam {
             detail.push_str(" SAM");
         }
@@ -826,16 +875,17 @@ fn try_read_hbin_hive<R: Read + Seek>(
     // Since we already filtered for hbin offset_in_hive==0, the NK cell at
     // offset 0x20 IS the root key by definition.
 
-    let name_len =
-        u16::from_le_bytes(first_block[cell_off + 0x4C..cell_off + 0x4E].try_into().unwrap())
-            as usize;
+    let name_len = u16::from_le_bytes(
+        first_block[cell_off + 0x4C..cell_off + 0x4E]
+            .try_into()
+            .unwrap(),
+    ) as usize;
     if name_len == 0 || cell_off + 0x50 + name_len > first_block.len() {
         return None;
     }
 
-    let name =
-        String::from_utf8_lossy(&first_block[cell_off + 0x50..cell_off + 0x50 + name_len])
-            .to_uppercase();
+    let name = String::from_utf8_lossy(&first_block[cell_off + 0x50..cell_off + 0x50 + name_len])
+        .to_uppercase();
 
     // Only accept target hive names
     if !matches!(name.as_str(), "SAM" | "SYSTEM" | "SECURITY") {
@@ -873,10 +923,8 @@ fn try_read_hbin_hive<R: Read + Seek>(
             break;
         }
 
-        let hbin_hive_off =
-            u32::from_le_bytes(hbin_buf[4..8].try_into().unwrap()) as usize;
-        let block_size =
-            u32::from_le_bytes(hbin_buf[8..12].try_into().unwrap()) as usize;
+        let hbin_hive_off = u32::from_le_bytes(hbin_buf[4..8].try_into().unwrap()) as usize;
+        let block_size = u32::from_le_bytes(hbin_buf[8..12].try_into().unwrap()) as usize;
         if !(0x1000..=0x100000).contains(&block_size) {
             break;
         }
@@ -911,19 +959,11 @@ fn try_read_hbin_hive<R: Read + Seek>(
     // Apply same size validation
     match name.as_str() {
         "SYSTEM" if total_size < MIN_SYSTEM_HIVE_SIZE => {
-            log::debug!(
-                "hbin hive '{}' too small ({}B), skipping",
-                name,
-                total_size
-            );
+            log::debug!("hbin hive '{}' too small ({}B), skipping", name, total_size);
             return None;
         }
         "SAM" if total_size < MIN_SAM_HIVE_SIZE => {
-            log::debug!(
-                "hbin hive '{}' too small ({}B), skipping",
-                name,
-                total_size
-            );
+            log::debug!("hbin hive '{}' too small ({}B), skipping", name, total_size);
             return None;
         }
         _ => {}
@@ -962,7 +1002,7 @@ fn scan_vmdk_grains_for_hives(
     // Phase 1: Collect candidates from grain data
     let mut regf_candidates: Vec<(u64, u64)> = Vec::new(); // (virtual_offset, bins_size)
     let mut hbin_root_candidates: Vec<(u64, String)> = Vec::new(); // (virtual_offset, name)
-    // ALL hbin blocks: (virtual_offset, offset_in_hive, block_size)
+                                                                   // ALL hbin blocks: (virtual_offset, offset_in_hive, block_size)
     let mut all_hbin_blocks: Vec<(u64, u32, u32)> = Vec::new();
 
     vmdk.scan_all_grains(|virtual_byte, grain_data| {
@@ -974,8 +1014,7 @@ fn scan_vmdk_grains_for_hives(
 
             // Check for "regf" signature
             if pos + 0x2C <= grain_data.len() && chunk[0..4] == *b"regf" {
-                let bins_size =
-                    u32::from_le_bytes(chunk[0x28..0x2C].try_into().unwrap()) as u64;
+                let bins_size = u32::from_le_bytes(chunk[0x28..0x2C].try_into().unwrap()) as u64;
                 if bins_size > 0 && bins_size <= MAX_HIVE_SIZE {
                     regf_candidates.push((virtual_byte + pos as u64, bins_size));
                 }
@@ -983,19 +1022,13 @@ fn scan_vmdk_grains_for_hives(
 
             // Check for "hbin" signature (ANY hbin block, not just offset=0)
             if pos + 0x20 <= grain_data.len() && chunk[0..4] == *b"hbin" {
-                let hbin_hive_off =
-                    u32::from_le_bytes(chunk[4..8].try_into().unwrap());
-                let hbin_size =
-                    u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+                let hbin_hive_off = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+                let hbin_size = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
                 if (0x1000..=0x100000).contains(&hbin_size)
                     && (hbin_hive_off as u64) < MAX_HIVE_SIZE
                     && hbin_hive_off % 0x1000 == 0
                 {
-                    all_hbin_blocks.push((
-                        virtual_byte + pos as u64,
-                        hbin_hive_off,
-                        hbin_size,
-                    ));
+                    all_hbin_blocks.push((virtual_byte + pos as u64, hbin_hive_off, hbin_size));
 
                     // For offset=0 blocks, parse root NK cell to identify hive
                     if hbin_hive_off == 0 {
@@ -1004,9 +1037,7 @@ fn scan_vmdk_grains_for_hives(
                             && &chunk[cell_off + 4..cell_off + 6] == b"nk"
                         {
                             let name_len = u16::from_le_bytes(
-                                chunk[cell_off + 0x4C..cell_off + 0x4E]
-                                    .try_into()
-                                    .unwrap(),
+                                chunk[cell_off + 0x4C..cell_off + 0x4E].try_into().unwrap(),
                             ) as usize;
                             if name_len > 0 && cell_off + 0x50 + name_len <= chunk.len() {
                                 let name = String::from_utf8_lossy(
@@ -1020,10 +1051,7 @@ fn scan_vmdk_grains_for_hives(
                                         virtual_byte,
                                         pos,
                                     );
-                                    hbin_root_candidates.push((
-                                        virtual_byte + pos as u64,
-                                        name,
-                                    ));
+                                    hbin_root_candidates.push((virtual_byte + pos as u64, name));
                                 }
                             }
                         }
@@ -1078,7 +1106,9 @@ fn scan_vmdk_grains_for_hives(
         };
         log::info!(
             "Grain scan: read {} hive at virt 0x{:x} ({} bytes)",
-            name, virt_off, total_size
+            name,
+            virt_off,
+            total_size
         );
         *target = Some(data);
 
@@ -1089,7 +1119,10 @@ fn scan_vmdk_grains_for_hives(
 
     match (sam_data, system_data) {
         (Some(sam), Some(system)) => return Ok(((sam, system, security_data), None)),
-        (s, sys) => { sam_data = s; system_data = sys; }
+        (s, sys) => {
+            sam_data = s;
+            system_data = sys;
+        }
     }
 
     // 2b: Try hbin root candidates — read contiguous hbin blocks
@@ -1118,10 +1151,8 @@ fn scan_vmdk_grains_for_hives(
             if &hbin_buf[0..4] != b"hbin" {
                 break;
             }
-            let hbin_hive_off =
-                u32::from_le_bytes(hbin_buf[4..8].try_into().unwrap()) as usize;
-            let block_size =
-                u32::from_le_bytes(hbin_buf[8..12].try_into().unwrap()) as usize;
+            let hbin_hive_off = u32::from_le_bytes(hbin_buf[4..8].try_into().unwrap()) as usize;
+            let block_size = u32::from_le_bytes(hbin_buf[8..12].try_into().unwrap()) as usize;
             if !(0x1000..=0x100000).contains(&block_size) {
                 break;
             }
@@ -1139,15 +1170,12 @@ fn scan_vmdk_grains_for_hives(
             read_offset += block_size as u64;
         }
 
-        if let Some(hive_data) = build_hive_from_hbins(
-            vmdk,
-            name,
-            &hbin_data,
-            &regf_candidates,
-        ) {
+        if let Some(hive_data) = build_hive_from_hbins(vmdk, name, &hbin_data, &regf_candidates) {
             log::info!(
                 "Grain scan: valid {} hive from contiguous hbin at virt 0x{:x} ({} bytes)",
-                name, hbin_virt, hive_data.len()
+                name,
+                hbin_virt,
+                hive_data.len()
             );
             *target = Some(hive_data);
         }
@@ -1156,7 +1184,10 @@ fn scan_vmdk_grains_for_hives(
     // If SYSTEM hive is too small, save it as fallback but allow Phase 2c to try
     // assembling a more complete hive from scattered hbin blocks.
     let mut small_system_fallback: Option<Vec<u8>> = None;
-    if system_data.as_ref().is_some_and(|d| (d.len() as u64) < MIN_SYSTEM_HIVE_SIZE) {
+    if system_data
+        .as_ref()
+        .is_some_and(|d| (d.len() as u64) < MIN_SYSTEM_HIVE_SIZE)
+    {
         log::info!(
             "SYSTEM hive only {} bytes (< {} minimum), will try fragmented assembly",
             system_data.as_ref().unwrap().len(),
@@ -1167,7 +1198,10 @@ fn scan_vmdk_grains_for_hives(
 
     match (sam_data, system_data) {
         (Some(sam), Some(system)) => return Ok(((sam, system, security_data), None)),
-        (s, sys) => { sam_data = s; system_data = sys; }
+        (s, sys) => {
+            sam_data = s;
+            system_data = sys;
+        }
     }
 
     // Phase 2c: Fragmented hive assembly
@@ -1208,11 +1242,12 @@ fn scan_vmdk_grains_for_hives(
                     // Greedy assembly will fill gaps with zeros.
                     let default = match name.as_str() {
                         "SYSTEM" => 0x800000u32, // 8MB
-                        _ => 0x10000u32,          // 64KB for SAM/SECURITY
+                        _ => 0x10000u32,         // 64KB for SAM/SECURITY
                     };
                     log::info!(
                         "Fragmented {}: no matching regf header, using default bins_size=0x{:x}",
-                        name, default,
+                        name,
+                        default,
                     );
                     default
                 }
@@ -1240,12 +1275,9 @@ fn scan_vmdk_grains_for_hives(
             );
 
             if let Some(hbin_data) = assembled {
-                if let Some(hive_data) = build_hive_from_hbins(
-                    vmdk,
-                    name,
-                    &hbin_data,
-                    &regf_candidates,
-                ) {
+                if let Some(hive_data) =
+                    build_hive_from_hbins(vmdk, name, &hbin_data, &regf_candidates)
+                {
                     log::info!(
                         "Grain scan: valid {} hive assembled from fragmented hbin blocks ({} bytes)",
                         name,
@@ -1338,7 +1370,10 @@ fn try_scattered_bootkey(
         blocks.push((off_in_hive, data));
     }
 
-    log::info!("Read {} hbin blocks for scattered bootkey scan", blocks.len());
+    log::info!(
+        "Read {} hbin blocks for scattered bootkey scan",
+        blocks.len()
+    );
     bootkey::scan_blocks_for_bootkey(&blocks)
 }
 
@@ -1377,7 +1412,10 @@ fn find_regf_for_hives(
         // Prefer the regf with the largest bins_size (most recent/complete)
         log::info!(
             "Matched regf at 0x{:x} as {} (bins_size=0x{:x}, path={})",
-            roff, hive_name, rbins, path.trim()
+            roff,
+            hive_name,
+            rbins,
+            path.trim()
         );
         if result.get(hive_name).is_none_or(|&(_, prev)| rbins > prev) {
             result.insert(hive_name, (roff, rbins));
@@ -1421,7 +1459,10 @@ fn assemble_fragmented_hive(
         {
             return Some(result);
         }
-        log::info!("Fragmented {}: backtracking failed, trying greedy fallback", name);
+        log::info!(
+            "Fragmented {}: backtracking failed, trying greedy fallback",
+            name
+        );
     }
     assemble_greedy(vmdk, hbin_by_offset, name, bins_size, root_data)
 }
@@ -1644,8 +1685,7 @@ fn assemble_greedy(
                     continue;
                 }
                 if block.len() >= 12 && &block[0..4] == b"hbin" {
-                    let actual_off =
-                        u32::from_le_bytes(block[4..8].try_into().unwrap());
+                    let actual_off = u32::from_le_bytes(block[4..8].try_into().unwrap());
                     if actual_off == next_offset {
                         assembled.extend_from_slice(&block);
                         next_offset += blk_size;
@@ -1776,7 +1816,7 @@ fn build_hive_from_hbins(
             "SECURITY" => path.contains("CONFIG\\SECURITY") || path.ends_with("\\SECURITY"),
             _ => false,
         };
-        if matches && best_regf.is_none_or(|(_,prev)| rbins > prev) {
+        if matches && best_regf.is_none_or(|(_, prev)| rbins > prev) {
             best_regf = Some((roff, rbins));
         }
     }
